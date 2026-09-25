@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, READING_STATUSES, STATES
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        reading_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in READING_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -33,6 +34,7 @@ class Repository:
                     severity TEXT NOT NULL,
                     quantity REAL NOT NULL DEFAULT 0,
                     threshold REAL NOT NULL DEFAULT 1,
+                    dose_limit REAL,
                     status TEXT NOT NULL CHECK(status IN ({statuses})),
                     version INTEGER NOT NULL DEFAULT 1,
                     external_ref TEXT,
@@ -54,6 +56,23 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    instrument_id TEXT NOT NULL,
+                    measured_at TEXT NOT NULL,
+                    raw_dose REAL NOT NULL,
+                    background REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    reason TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ({reading_statuses})),
+                    supersedes INTEGER,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, instrument_id, measured_at, version)
+                );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,23 +85,28 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(items)")}
+        if "dose_limit" not in columns:
+            with self.conn:
+                self.conn.execute("ALTER TABLE items ADD COLUMN dose_limit REAL")
+                self.conn.execute("UPDATE items SET dose_limit=threshold WHERE dose_limit IS NULL")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
         return dict(row)
 
     def create_item(self, title: str, description: str, severity: str,
-                    quantity: float, threshold: float, external_ref: Optional[str],
-                    actor: str) -> Dict[str, Any]:
+                    quantity: float, threshold: float, dose_limit: Optional[float],
+                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
         now = utc_now()
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                       dose_limit, status, version, external_ref, created_by, created_at,
+                       updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (title, description, severity, quantity, threshold, dose_limit,
+                     STATES[0], 1, external_ref, actor, now, now),
                 )
                 item_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -156,6 +180,124 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def add_reading(self, item_id: int, instrument_id: str, measured_at: str,
+                    raw_dose: float, background: float, source: str,
+                    actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        with self._lock, self.conn:
+            duplicate = self.conn.execute(
+                """SELECT 1 FROM readings
+                   WHERE item_id=? AND instrument_id=? AND measured_at=? LIMIT 1""",
+                (item_id, instrument_id, measured_at),
+            ).fetchone()
+            if duplicate is not None:
+                raise ConflictError("同一仪器同一时间的读数已存在，重复上传被拒绝")
+            cur = self.conn.execute(
+                """INSERT INTO readings(item_id, instrument_id, measured_at, raw_dose,
+                   background, source, version, reason, status, supersedes, created_by,
+                   created_at) VALUES(?,?,?,?,?,?,1,NULL,'pending',NULL,?,?)""",
+                (item_id, instrument_id, measured_at, raw_dose, background, source,
+                 actor, now),
+            )
+            reading_id = int(cur.lastrowid)
+        return self.get_reading(reading_id)
+
+    def get_reading(self, reading_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM readings WHERE id=?", (reading_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("读数不存在")
+        return dict(row)
+
+    def list_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM readings WHERE item_id=?
+                   ORDER BY instrument_id, measured_at, version""",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_group_version(self, item_id: int, instrument_id: str,
+                             measured_at: str) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM readings
+                   WHERE item_id=? AND instrument_id=? AND measured_at=?
+                   ORDER BY version DESC LIMIT 1""",
+                (item_id, instrument_id, measured_at),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("读数不存在")
+        return dict(row)
+
+    def confirm_reading_group(self, item_id: int, instrument_id: str,
+                              measured_at: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE readings SET status='confirmed'
+                   WHERE item_id=? AND instrument_id=? AND measured_at=?""",
+                (item_id, instrument_id, measured_at),
+            )
+        return self.latest_group_version(item_id, instrument_id, measured_at)
+
+    def add_correction(self, item_id: int, instrument_id: str, measured_at: str,
+                       raw_dose: float, background: float, source: str, reason: str,
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            latest = self.conn.execute(
+                """SELECT * FROM readings
+                   WHERE item_id=? AND instrument_id=? AND measured_at=?
+                   ORDER BY version DESC LIMIT 1""",
+                (item_id, instrument_id, measured_at),
+            ).fetchone()
+            if latest is None:
+                raise NotFoundError("读数不存在")
+            cur = self.conn.execute(
+                """INSERT INTO readings(item_id, instrument_id, measured_at, raw_dose,
+                   background, source, version, reason, status, supersedes, created_by,
+                   created_at) VALUES(?,?,?,?,?,?,?,?, 'pending', ?, ?, ?)""",
+                (item_id, instrument_id, measured_at, raw_dose, background, source,
+                 int(latest["version"]) + 1, reason, int(latest["id"]), actor, now),
+            )
+            reading_id = int(cur.lastrowid)
+        return self.get_reading(reading_id)
+
+    def effective_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        best: Dict[str, Dict[str, Any]] = {}
+        for row in self.list_readings(item_id):
+            current = best.get(row["instrument_id"])
+            if current is None or (row["measured_at"], row["version"]) > (
+                    current["measured_at"], current["version"]):
+                best[row["instrument_id"]] = row
+        return [best[key] for key in sorted(best)]
+
+    def cumulative_net(self, item_id: int) -> float:
+        return sum(max(0.0, row["raw_dose"] - row["background"])
+                   for row in self.effective_readings(item_id))
+
+    def refresh_item_totals(self, item_id: int, quantity: float,
+                            target_status: Optional[str]) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            if target_status:
+                self.conn.execute(
+                    """UPDATE items SET quantity=?, status=?, version=version+1,
+                       updated_at=? WHERE id=?""",
+                    (quantity, target_status, now, item_id),
+                )
+            else:
+                self.conn.execute(
+                    """UPDATE items SET quantity=?, version=version+1, updated_at=?
+                       WHERE id=?""",
+                    (quantity, now, item_id),
+                )
+        return self.get_item(item_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

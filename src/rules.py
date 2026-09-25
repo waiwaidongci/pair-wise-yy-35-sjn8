@@ -1,8 +1,11 @@
 from __future__ import annotations
+from datetime import datetime, timezone
 from .domain import ConflictError, ValidationError
 TITLE='职业辐射剂量与异常事件'; ENTITY='剂量事件'; ID_PREFIX='RD'
 SEVERITIES=['low', 'elevated', 'high', 'critical']; STATES=['recorded', 'reviewing', 'investigation', 'follow_up', 'closed']; TRANSITIONS={'recorded': ['reviewing'], 'reviewing': ['investigation'], 'investigation': ['follow_up'], 'follow_up': ['closed'], 'closed': []}; TRANSITION_ROLES={'reviewing': ['radiation_officer'], 'investigation': ['radiation_officer'], 'follow_up': ['health_physicist'], 'closed': ['health_physicist']}
 CREATE_ROLES=set(['dosimetrist']); RECORD_ROLES=set(['radiation_officer', 'health_physicist']); AUDIT_ROLES=set(['health_physicist', 'viewer']); VIEW_ROLES=set(['dosimetrist', 'radiation_officer', 'health_physicist', 'viewer'])
+READING_UPLOAD_ROLES=set(['dosimetrist', 'radiation_officer']); READING_CONFIRM_ROLES=set(['radiation_officer']); READING_CORRECT_ROLES=set(['radiation_officer', 'health_physicist'])
+READING_STATUSES=['pending', 'confirmed']; INVESTIGATION_STATE='investigation'; FOLLOW_UP_STATE='follow_up'
 SEVERITY_WEIGHT={'low': 1.0, 'elevated': 3.0, 'high': 6.0, 'critical': 9.0}; DEADLINE_HOURS={'low': 72, 'elevated': 24, 'high': 8, 'critical': 4}; TERMINAL_STATES=set(['closed'])
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
@@ -14,6 +17,21 @@ def response_deadline_hours(severity,quantity=0.0,threshold=1.0):
     return max(1,int(DEADLINE_HOURS[severity]/max(1.0,ratio)))
 def escalation_required(severity,quantity=0.0,threshold=1.0):
     return severity==SEVERITIES[-1] or (threshold>0 and quantity>=threshold)
+def follow_up_required(quantity=0.0,dose_limit=None):
+    return dose_limit is not None and dose_limit>0 and quantity>=dose_limit
+def escalation_target(current_status,quantity=0.0,threshold=1.0,dose_limit=None):
+    target=None
+    if threshold>0 and quantity>=threshold: target=INVESTIGATION_STATE
+    if follow_up_required(quantity,dose_limit): target=FOLLOW_UP_STATE
+    if target is None or current_status not in STATES: return None
+    if STATES.index(current_status)>=STATES.index(target): return None
+    return target
+def remaining_report_hours(created_at,deadline_hours,now=None):
+    if now is None: now=datetime.now(timezone.utc)
+    created=datetime.fromisoformat(str(created_at).replace("Z","+00:00"))
+    if created.tzinfo is None: created=created.replace(tzinfo=timezone.utc)
+    elapsed=(now-created).total_seconds()/3600.0
+    return round(float(deadline_hours)-elapsed,2)
 def can_transition(current,target): return target in TRANSITIONS.get(current,[])
 def validate_transition(current,target):
     if current not in STATES or target not in STATES: raise ValidationError("未知状态")
