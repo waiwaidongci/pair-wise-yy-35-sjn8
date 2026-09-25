@@ -25,14 +25,25 @@ python3 app.py --db ./data.db --port 8312
 ## 主要接口
 
 - `GET /health`
-- `GET /api/items`
-- `POST /api/items`
+- `GET /api/items`（按当前累计剂量重算的优先级降序排列，支持`?status=`过滤）
+- `POST /api/items`（可传`dose_limit`剂量限值，默认50）
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
+- `POST /api/items/{id}/readings`：登记一路探测器读数，必填`instrument_id`、`measured_at`（ISO 8601，统一转UTC）、`raw_dose`、`background`、`source`；同一仪器同一时间重复上传返回409
+- `GET /api/items/{id}/readings`：默认返回全部历史版本，`?effective=1`只看当前有效版本
+- `POST /api/items/{id}/readings/{reading_id}/confirm`：确认读数（radiation_officer）
+- `POST /api/items/{id}/readings/correct`：对已确认读数追加更正版本，必须填写`reason`，更正版确认前累计仍按原版本计算
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
-- `GET /api/audit`
+- `GET /api/audit`（支持`?item_id=`过滤）
 
-允许角色：dosimetrist, radiation_officer, health_physicist, viewer。剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。
+允许角色：dosimetrist, radiation_officer, health_physicist, viewer。读数上传：dosimetrist/radiation_officer；确认：radiation_officer；更正：radiation_officer/health_physicist。
+
+## 读数与累计规则
+
+- 待确认（pending）读数不计入累计；确认后不能改写，只能追加更正版本并填写原因。
+- 累计剂量 = 各路仪器最新已确认版本的`max(0, raw_dose - background)`之和；无已确认读数时回退到登记总量`quantity`。
+- 扣除本底后的累计值超过调查水平`threshold`时`escalation_required=true`（须进入调查）；达到剂量限值`dose_limit`时`follow_up_required=true`（须补医学随访）。
+- 优先级、剩余报告时间`remaining_hours`和列表顺序都按当前累计结果实时重算；历史版本与SHA-256审计链始终可查。
 
 ## 测试
 
